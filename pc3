@@ -95,9 +95,57 @@ Manejo de fallas:
   DLQ (Dead Letter Queue) para eventos que fallan repetidamente al procesarse (ej. callback malformado), con alerta y reproceso manual/automatizado.
   TTL en el bloqueo de agenda: si no llega respuesta de pago dentro del plazo, la reserva se libera automáticamente.
 
+Observabilidad:
+  correlation_id único por solicitud de reserva/pago, propagado en headers HTTP y en el payload de todos los eventos, de extremo a extremo (cliente → ms-tutorias → ms-pagos → proveedor → callback → de vuelta).
+  Trazas distribuidas (ej. OpenTelemetry) para reconstruir la línea de tiempo completa de una solicitud a través de los tres servicios.
+  Logs estructurados con correlation_id, payment_intent_id y estado, sin incluir datos sensibles de pago.
+  Métricas clave: cantidad de intenciones de pago en estado PENDIENTE por más de X segundos, tasa de reembolsos por pago-tardío, latencia p95/p99 de respuesta del proveedor, tasa de eventos en DLQ.
+  Diagnóstico ante incidentes: con correlation_id y estados explícitos (PENDIENTE_PAGO, CONFIRMADA, CANCELADA_POR_TIMEOUT, CANCELADA_CON_REEMBOLSO) se puede reconstruir cualquier caso de soporte sin necesidad de acceso directo a los proveedores externos.
+
+Seguridad:
+  Datos sensibles de pago (PAN, CVV) nunca transitan ni se almacenan en ms-tutorias; idealmente van del cliente directo al proveedor o a ms-pagos vía tokenización (SDK/iframe del proveedor), minimizando el alcance PCI-DSS.
+  ms-tutorias solo conoce y persiste un payment_intent_id opaco.
+  Autenticación servicio-a-servicio: mTLS o tokens firmados (OAuth2 client credentials) entre ms-tutorias, ms-pagos y el bus de eventos.
+  Autorización: solo ms-tutorias, como orquestador autorizado, puede iniciar una intención de pago para un tutoria_id dado; ms-pagos valida esa autorización antes de proceder.
+  Callbacks/webhooks del proveedor: deben verificarse con firma criptográfica (HMAC) del proveedor, validar timestamp/nonce para evitar replay, y procesarse de forma idempotente (cubierto por el Inbox de la sección 7).
+
+Despliegue y costo:
+  ms-tutorias y ms-pagos: contenedores (Kubernetes/ECS/Cloud Run) con autoescalado horizontal por CPU/latencia de cola. Justificación: son los componentes con tráfico síncrono inicial (creación de intención) donde la latencia consistente importa.
+  Procesamiento de callbacks/eventos asíncronos (consumo de payment.authorized/declined/expired, aplicación de Inbox, disparo de notificaciones): candidatos ideales para serverless (Lambda/Cloud Functions), ya que el tráfico de pagos es en ráfagas (picos de matrícula) y el costo escala a cero en periodos bajos.
+  PaaS (ej. Cloud Run) es un punto intermedio razonable si se quiere evitar operar Kubernetes completo mientras se mantienen contenedores para los servicios principales.
+  Recomendación: contenedores con autoescalado para ms-tutorias/ms-pagos (consistencia de latencia), combinados con consumidores serverless para el procesamiento asíncrono de eventos/callbacks (costo proporcional a demanda real, sin sobreaprovisionar infraestructura fija durante los valles del semestre).
+
+Decisión: 
+  Se recomienda adoptar el diseño de la sección 4 (saga orquestada por ms-tutorias, con Outbox/Inbox, idempotencia end-to-end, reserva de agenda con TTL y separación estricta de datos sensibles en ms-pagos), en lugar del diseño original de transacción síncrona anidada.
+
+Riesgos residuales:
+  Ventana de tiempo entre PENDIENTE_PAGO y la resolución final del pago, durante la cual el cupo está "tentativamente" tomado (mitigado con TTL corto, pero no eliminado).
+  Complejidad operativa adicional (Outbox, Inbox, DLQ, eventos versionados) frente al diseño original, que requiere inversión inicial en infraestructura de mensajería y disciplina de equipo.
+  Dependencia de que el proveedor externo soporte idempotency_key; si no lo soporta nativamente, la deduplicación recae enteramente en ms-pagos.
+
+Condiciones para revisar esta decisión:
+  Si el volumen de solicitudes concurrentes es muy bajo y estable (sin picos), podría evaluarse simplificar la infraestructura de eventos.
+  Si el proveedor de pagos ofrece garantías síncronas fuertes de baja latencia (SLA verificado), podría reconsiderarse acortar la ventana de PENDIENTE_PAGO.
+  Revisar métricas de DLQ y tiempo en PENDIENTE_PAGO tras el primer trimestre en producción para ajustar TTLs y timeouts.
 
 
-Observabilidad. Defina logs, métricas, trazas, correlation IDs y diagnóstico ante incidentes.
-Seguridad. Declare límites de confianza, autenticación, autorización, datos sensibles y responsabilidades entre servicios.
-Despliegue y costo. Compare contenedores, PaaS o serverless según aplique, considerando escalabilidad, complejidad y costo operativo.
-Decisión. Cierre con la decisión recomendada, riesgos residuales y condiciones para revisarla en el futuro.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
