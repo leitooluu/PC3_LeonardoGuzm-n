@@ -1,0 +1,68 @@
+Formato obligatorio de respuesta: mini RFC
+Contexto: El equipo desea incorporar la funcionalidad "Pago de Tutorias" al sistema existente. La tutoria solo puede avanzar si hay un pago válido y trazable.
+Servicios involucrados:
+ms-tutorias: dueño del dominio de tutorías, agenda y notificaciones.
+ms-pagos (nuevo): dueño de la relación con proveedores externos de pago.
+Proveedores externos (Visa, Mastercard): fuera de nuestro control, con latencia variable, rechazos, respuestas duplicadas, callbacks tardíos o ausencia de respuesta dentro del timeout esperado.
+Restricciones relevantes: el proveedor externo puede tardar segundos en responder o responder después de que el cliente/servicio ya abandonó la espera; 
+el sistema debe tolerar duplicados por doble clic, refresh o reintentos automáticos; debe existir trazabilidad extremo a extremo; 
+los datos sensibles de pago deben aislarse; y la demanda es variable (picos en inicio de semestre), por lo que el costo operativo debe ser razonable.
+
+Problema: 
+El diseño propuesto por el equipo ejecuta, dentro de una sola transacción de base de datos en ms-tutorias, una llamada HTTP síncrona a ms-pagos, 
+que a su vez llama síncronamente al proveedor externo y espera su respuesta final antes de continuar.
+Esto es riesgoso porque:
+1. Ata la duración de una transacción de base de datos local a la latencia de un sistema externo que no controlamos.
+2. Trata un problema inherentemente distribuido y asíncrono (pago con proveedor externo) como si fuera una operación local y síncrona.
+3. Asume que "todo ocurre en orden" es suficiente garantía de consistencia, cuando en realidad el orden temporal de la respuesta del proveedor 
+no está garantizado respecto al ciclo de vida de la solicitud en ms-tutorias.
+4. El argumento del equipo ("es simple porque todo ocurre en orden y ms-tutorias conserva el control") no resiste el análisis de los escenarios 
+de falla obligatorios del enunciado, detallados en la siguiente sección.
+
+Riesgos: 
+1. Tecnicos: 
+  1.1 Transacción larga con locks retenidos durante una llamada de red externa, degradando el throughput de agenda/tutorías para todos los usuarios concurrentes.
+  1.2 Timeout del cliente o del gateway antes que el proveedor responda: ms-tutorias revierte la transacción y reporta error, pero el proveedor puede aprobar el cobro segundos después → cobro sin tutoría reservada.
+  1.3 Reintentos del cliente (doble clic, refresh, retry automático) re-ejecutan todo el flujo sin idempotencia → cobros duplicados.
+  1.4 Respuestas duplicadas del proveedor o reentregas de callback, sin deduplicación, pueden aplicar el mismo pago dos veces en el lado de negocio.
+  1.5 Fallas parciales: agenda bloqueada pero pago no confirmado, o pago confirmado pero notificación nunca enviada, dejan al sistema en estados inconsistentes sin mecanismo de recuperación.
+  1.6 Falta de trazabilidad: sin correlation_id propagado, reconstruir un incidente de pago-tutoría desalineados es prácticamente imposible.
+
+2. De Negocio:
+  2.1 Disputas y contracargos por cobros sin servicio asociado, con impacto reputacional.
+  2.2 Soporte manual costoso para reconciliar pagos huérfanos.
+  2.3 Pérdida de disponibilidad de agenda: cupos bloqueados indefinidamente por solicitudes que nunca se resolvieron.
+
+3. De seguridad:
+  3.1 Si datos sensibles de pago transitan o se registran en ms-tutorias (logs, payloads), se amplía innecesariamente el alcance de cumplimiento (PCI-DSS) a un servicio que no debería manejarlos.
+
+4. Operacionales:
+  4.1 Sin circuit breaker, un proveedor degradado puede saturar hilos/conexiones de ms-tutorias y ms-pagos en cascada.
+
+Diseño propuesto:
+Arquitectura basada en saga (orquestación ligera en ms-tutorias + eventos asíncronos), separando el ciclo de vida de la tutoría del ciclo de vida del pago.
+Responsabilidades por servicio:
+ms-tutorias: dueño de agenda y tutoría. Crea la intención de pago, bloquea agenda de forma tentativa (con TTL), y reacciona a eventos de resultado de pago para confirmar o compensar. Nunca maneja datos sensibles de pago, solo un payment_intent_id.
+ms-pagos: dueño exclusivo de la comunicación con proveedores externos, tokenización, reintentos ante el proveedor y emisión de eventos de resultado.
+Notificaciones: se disparan de forma desacoplada al recibir eventos de estado final (confirmado/cancelado).
+Flujo principal:
+Cliente solicita reservar y pagar una tutoría.
+ms-tutorias, en una sola transacción local, crea la tutoría en estado PENDIENTE_PAGO, bloquea agenda tentativamente (con expiración) y escribe un evento PaymentIntentRequested en su tabla Outbox.
+Un publicador de Outbox envía el evento a ms-pagos (mensajería asíncrona o llamada HTTP corta solo para registrar la intención, sin esperar el resultado final del proveedor).
+ms-pagos interactúa con el proveedor externo (Visa/Mastercard) de forma asíncrona; el resultado llega por callback/webhook.
+ms-pagos valida el callback, lo deduplica y publica PaymentAuthorized, PaymentDeclined o PaymentExpired.
+ms-tutorias consume el evento vía Inbox (deduplicado), y: 
+Si PaymentAuthorized y la reserva sigue vigente → confirma la tutoría.
+Si PaymentAuthorized pero la reserva ya expiró/fue cancelada → dispara compensación (reembolso automático vía ms-pagos).
+Si PaymentDeclined/PaymentExpired → libera la agenda y notifica al cliente.
+Notificaciones se disparan por evento, no como paso bloqueante del flujo principal.
+
+
+
+Alternativas consideradas. Compare al menos dos alternativas y explique por qué acepta o descarta cada una.
+Contratos. Defina contratos HTTP y/o eventos mínimos, versionamiento, compatibilidad y errores relevantes.
+Manejo de fallas. Explique idempotencia, consistencia de datos, reintentos, timeouts, Outbox/Inbox, DLQ o compensación cuando corresponda.
+Observabilidad. Defina logs, métricas, trazas, correlation IDs y diagnóstico ante incidentes.
+Seguridad. Declare límites de confianza, autenticación, autorización, datos sensibles y responsabilidades entre servicios.
+Despliegue y costo. Compare contenedores, PaaS o serverless según aplique, considerando escalabilidad, complejidad y costo operativo.
+Decisión. Cierre con la decisión recomendada, riesgos residuales y condiciones para revisarla en el futuro.
